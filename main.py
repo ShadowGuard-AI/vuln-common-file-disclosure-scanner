@@ -3,7 +3,13 @@ import logging
 import requests
 import os
 import sys
+import hashlib
 from urllib.parse import urlparse
+
+# A name that will not exist on a real target. Its response is the baseline:
+# a probe that answers exactly like this absent file is a catchall page,
+# not a disclosed file.
+BASELINE_FILE = "baseline-absent-9f3k7q.txt" 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,38 +42,32 @@ def setup_argparse():
     parser.add_argument("-t", "--timeout", type=int, default=5, help="Timeout for HTTP requests (default: 5 seconds).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     parser.add_argument("-o", "--output", help="Output file to save results to.")
+    parser.add_argument("--include-content", action="store_true", help="Include full file contents in the output file. By default the report records URL, status, size, and a SHA-256 hash only.")
     return parser
 
-def check_file_exists(url, filename, timeout=5):
+def fetch_file(url, filename, timeout=5):
     """
-    Checks if a file exists at the given URL.
-
-    Args:
-        url (str): The base URL of the website.
-        filename (str): The name of the file to check.
-        timeout (int): Timeout for the HTTP request in seconds.
+    Fetches one path and reports what actually happened.
 
     Returns:
-        bool: True if the file exists and returns a 200 status code, False otherwise.
+        tuple: (target_url, response_or_None, error_or_None). A response of
+        any status means the target was reached; an error means it was not.
     """
+    target_url = urljoin(url, filename)
+    logging.debug(f"Checking for: {target_url}")
     try:
-        target_url = urljoin(url, filename)  # Construct the full URL
-        logging.debug(f"Checking for: {target_url}")
         response = requests.get(target_url, timeout=timeout, allow_redirects=True)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        if response.status_code == 200:
-            logging.info(f"Found: {target_url} (Status Code: {response.status_code})")
-            return True, target_url, response.text # return the url and the content
-        else:
-            logging.debug(f"Not Found: {target_url} (Status Code: {response.status_code})")
-            return False, target_url, None
-
+        return target_url, response, None
     except requests.exceptions.RequestException as e:
         logging.debug(f"Error checking {filename}: {e}")
-        return False, target_url, None
+        return target_url, None, e
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        return False, target_url, None
+        return target_url, None, e
+
+
+def body_hash(text):
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
 def urljoin(base, url):
@@ -120,28 +120,62 @@ def main():
 
     logging.info(f"Starting scan for {args.url}...")
 
-    found_files = {}  # Store found files and their content
+    # Baseline first: fetch a file that is certainly absent, so a catchall
+    # server that answers 200 for every path cannot manufacture findings.
+    _, baseline_response, baseline_error = fetch_file(args.url, BASELINE_FILE, args.timeout)
+    baseline_status = baseline_response.status_code if baseline_response is not None else None
+    baseline_hash = body_hash(baseline_response.text) if baseline_response is not None else None
+
+    found_files = {}  # url -> report dict (content only with --include-content)
+    reached = 0
+    attempted = 0
 
     for filename in args.files:
-        exists, url, content = check_file_exists(args.url, filename, args.timeout)
-        if exists:
-            found_files[url] = content
+        attempted += 1
+        url, response, error = fetch_file(args.url, filename, args.timeout)
+        if response is None:
+            continue
+        reached += 1
+        if response.status_code != 200:
+            logging.debug(f"Not Found: {url} (Status Code: {response.status_code})")
+            continue
+        digest = body_hash(response.text)
+        if baseline_status == 200 and digest == baseline_hash:
+            logging.debug(f"Matches the baseline response, not a finding: {url}")
+            continue
+        logging.info(f"Found: {url} (Status Code: {response.status_code})")
+        entry = {
+            "status": response.status_code,
+            "size": len(response.content),
+            "sha256": digest,
+        }
+        if args.include_content:
+            entry["content"] = response.text
+        found_files[url] = entry
+
+    if attempted and reached == 0:
+        logging.error("Scan did not complete: no probe reached the target. No verdict is reported.")
+        sys.exit(1)
 
     if found_files:
         logging.info("The following potentially sensitive files were found:")
-        for url, content in found_files.items():
+        for url in found_files:
             logging.info(f"- {url}")
     else:
         logging.info("No sensitive files were found.")
-        
+
     if args.output:
       try:
         with open(args.output, "w") as f:
             if found_files:
                 f.write("Potentially sensitive files found:\n")
-                for url, content in found_files.items():
+                for url, entry in found_files.items():
                     f.write(f"URL: {url}\n")
-                    f.write(f"Content:\n{content}\n")
+                    f.write(f"Status: {entry['status']}\n")
+                    f.write(f"Size: {entry['size']}\n")
+                    f.write(f"SHA-256: {entry['sha256']}\n")
+                    if "content" in entry:
+                        f.write(f"Content:\n{entry['content']}\n")
                     f.write("-" * 40 + "\n")
             else:
                 f.write("No sensitive files found.\n")
@@ -149,6 +183,7 @@ def main():
 
       except Exception as e:
         logging.error(f"Error writing to output file: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
