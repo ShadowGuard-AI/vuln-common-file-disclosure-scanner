@@ -66,6 +66,9 @@ def fetch_file(url, filename, timeout=5):
         return target_url, None, e
 
 
+# The hash runs over the decoded text, re-encoded with replace, not over the
+# raw response bytes. Two bodies that decode to the same text hash the same
+# here even if their raw bytes differed in ways decoding erased.
 def body_hash(text):
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
@@ -81,6 +84,9 @@ def urljoin(base, url):
     Returns:
         str: The combined URL.
     """
+    # My own join, not urllib's: I always treat the base as a directory and
+    # append. A base that names a page, like /index.php, gets the file name
+    # hung after it, so pass a directory URL if that is not what you want.
     if base.endswith('/'):
         base = base[:-1]  # Remove trailing slash from base URL if present
     if url.startswith('/'):
@@ -144,6 +150,9 @@ def main():
             logging.debug(f"Matches the baseline response, not a finding: {url}")
             continue
         logging.info(f"Found: {url} (Status Code: {response.status_code})")
+        # Size counts raw bytes while the hash above counts decoded text.
+        # For a body with multi byte characters the two describe the same
+        # response through different lenses, and neither is a typo.
         entry = {
             "status": response.status_code,
             "size": len(response.content),
@@ -151,6 +160,9 @@ def main():
         }
         if args.include_content:
             entry["content"] = response.text
+        # Keyed by URL, so naming the same file twice in --files probes it
+        # twice and keeps one entry. The count that matters is reached, and
+        # that one counts both probes.
         found_files[url] = entry
 
     if attempted and reached == 0:
